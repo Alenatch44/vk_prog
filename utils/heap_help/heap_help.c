@@ -5,7 +5,6 @@
 #include <errno.h>
 #include <execinfo.h>
 #include <netdb.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,20 +27,11 @@ enum {
 
 enum report_mode {
 	// Report always. Even when have no leaks.
-	REPORT_MODE_VERBOSE,
+	MODE_VERBOSE,
 	// Report only if there are leaks.
-	REPORT_MODE_LEAKS,
+	MODE_LEAKS,
 	// Do not report anything.
-	REPORT_MODE_QUIET,
-};
-
-enum content_mode {
-	// Leave the resulting memory untouched like returned from the standard
-	// library.
-	CONTENT_MODE_ORIGINAL,
-	// Fill the new memory with trash bytes to easier catch bugs when people
-	// use not initialized memory.
-	CONTENT_MODE_TRASH,
+	MODE_QUIET,
 };
 
 // Single allocation done on the heap by a user.
@@ -70,8 +60,7 @@ static bool is_init_done = false;
 static bool is_exit_done = false;
 static __thread int init_lock_count = 0;
 static __thread int depth = 0;
-static enum report_mode report_mode = REPORT_MODE_LEAKS;
-static enum content_mode content_mode = CONTENT_MODE_ORIGINAL;
+static enum report_mode report_mode = MODE_LEAKS;
 
 // Before the original heap functions are retrieved, there is a dummy static
 // allocator working. It is needed because on some platforms the original
@@ -102,17 +91,6 @@ static int (*default_getaddrinfo)(
 static void (*default_freeaddrinfo)(struct addrinfo *) = NULL;
 
 static void
-heaph_printf(const char *format, ...)
-{
-	va_list args;
-	va_start(args, format);
-	char msg[1024];
-	vsnprintf(msg, sizeof(msg), format, args);
-	va_end(args);
-	write(STDOUT_FILENO, msg, strlen(msg));
-}
-
-static void
 heaph_assert_do(bool flag, const char *expr, int line)
 {
 	if (flag)
@@ -122,11 +100,12 @@ heaph_assert_do(bool flag, const char *expr, int line)
 	volatile const char *err_msg = strerror(err);
 	(void)err;
 	(void)err_msg;
-	heaph_printf("\n");
-	heaph_printf("HH: assertion failure, line %d\n", line);
-	heaph_printf("HH: ");
+	char warn[128];
+	sprintf(warn, "HH: assertion failure, line %d", line);
+	write(STDOUT_FILENO, warn, strlen(warn));
+	write(STDOUT_FILENO, "HH: ", 4);
 	write(STDOUT_FILENO, expr, strlen(expr));
-	heaph_printf("\n");
+	write(STDOUT_FILENO, "\n", 1);
 	abort();
 }
 
@@ -234,14 +213,14 @@ alloc_free(void *ptr)
 			int64_t new_count = --alloc_count;
 			spinlock_rel(&allocs_lock);
 
-			heaph_assert(new_count >= 0 && "freeing bad memory");
+			heaph_assert(new_count >= 0);
 			return;
 		}
 		prev = a;
 		a = a->next;
 	}
 	spinlock_rel(&allocs_lock);
-	heaph_assert(!"freeing bad memory");
+	heaph_assert(false);
 }
 
 static void
@@ -264,8 +243,6 @@ static_malloc(size_t size)
 	heaph_assert(static_size >= static_used);
 	heaph_assert(size < (size_t)(static_size - static_used));
 	void *res = static_buf + static_used;
-	if (content_mode == CONTENT_MODE_TRASH)
-		memset(res, '#', size);
 	static_used += size;
 	return res;
 }
@@ -332,10 +309,6 @@ trace_sym_is_internal(const struct symbol *sym)
 		return true;
 	if (trace_sym_is_func(sym, "_IO_printf"))
 		return true;
-	if (trace_sym_is_func(sym, "_IO_puts"))
-		return true;
-	if (trace_sym_is_func(sym, "_IO_vfscanf"))
-		return true;
 	if (trace_sym_file_starts_with(sym, "libpthread.so"))
 		return true;
 	return false;
@@ -351,22 +324,20 @@ trace_is_internal(const struct symbol *syms, int count)
 	return false;
 }
 
-static int
+static void
 trace_resolve(void *const *addrs, int count, struct symbol *syms)
 {
-	int failures = 0;
 	Dl_info info;
 	for (int i = 0; i < count; ++i) {
 		struct symbol *s = &syms[i];
 		if (dladdr(addrs[i], &info) == 0) {
-			failures++;
+			printf("HH: dladdr() failure\n");
 			memset(s, 0, sizeof(*s));
 			continue;
 		}
 		s->name = info.dli_sname;
 		s->file = info.dli_fname;
 	}
-	return failures;
 }
 
 static void
@@ -376,16 +347,15 @@ heaph_atexit(void)
 	// manually filter out all calls except for the first one.
 	if (__atomic_test_and_set(&is_exit_done, __ATOMIC_SEQ_CST))
 		return;
-	if (report_mode == REPORT_MODE_QUIET)
+	if (report_mode == MODE_QUIET)
 		return;
 	spinlock_acq(&allocs_lock);
 	int64_t count = alloc_count;
 	if (count == 0) {
 		spinlock_rel(&allocs_lock);
-		if (report_mode == REPORT_MODE_VERBOSE) {
-			heaph_printf("\n");
-			heaph_printf("HH: found no leaks\n");
-			heaph_printf("HH: total allocation count - %llu\n",
+		if (report_mode == MODE_VERBOSE) {
+			printf("HH: found no leaks\n");
+			printf("HH: total allocation count - %llu\n",
 			       (long long)alloc_count_total);
 		}
 		return;
@@ -395,55 +365,41 @@ heaph_atexit(void)
 	int report_count = 0;
 	int64_t total_count = count;
 	uint64_t leak_size = 0;
-	int64_t total_fail_count = 0;
 	struct symbol syms[MAX_BACKTRACE_LEN];
-	// People often do not write '\n' in the end of their program. That
-	// makes it harder to read HH output unless the latter prepends itself
-	// with a line wrap.
-	const char *prefix = "\n";
 	for (; a != NULL; a = a->next) {
 		heaph_assert(count > 0);
 		if (a->trace_size == 0) {
 			--count;
 			continue;
 		}
-		total_fail_count += trace_resolve(a->trace, a->trace_size, syms);
+		trace_resolve(a->trace, a->trace_size, syms);
 		bool is_internal = trace_is_internal(syms, a->trace_size);
 		if (is_internal) {
 			--count;
 		} else if (report_count < report_limit) {
-			heaph_printf("%s", prefix), prefix = "";
-			heaph_printf("#### Leak %d (%zu bytes) ####\n",
-				     ++report_count, a->size);
+			printf("#### Leak %d (%zu bytes) ####\n",
+			       ++report_count, a->size);
 			for (int i = 0; i < a->trace_size; ++i)
-				heaph_printf("%d - %s\n", i, syms[i].name);
+				printf("%d - %s\n", i, syms[i].name);
 		}
 		if (!is_internal)
 			leak_size += a->size;
 	}
 	spinlock_rel(&allocs_lock);
 
-	if (total_fail_count > 0) {
-		heaph_printf("\nHH: dladdr() failure %lld times\n",
-		             (long long)total_fail_count);
-	}
-
-	if (count == 0 && report_mode != REPORT_MODE_VERBOSE)
+	if (count == 0 && report_mode != MODE_VERBOSE)
 		return;
 	int64_t suppressed_count = total_count - count;
-	heaph_printf("%s", prefix), prefix = "";
-	heaph_printf("HH: found %lld leaks (%llu bytes)\n", (long long)count,
-		     (long long)leak_size);
+	printf("HH: found %lld leaks (%llu bytes)\n", (long long)count,
+	       (long long)leak_size);
 	if (suppressed_count != 0) {
-		heaph_printf("HH: suppressed %lld internal leaks\n",
-			     (long long)suppressed_count);
+		printf("HH: suppressed %lld internal leaks\n",
+		       (long long)suppressed_count);
 	}
-	if (report_count < count) {
-		heaph_printf("HH: only first %d reports are shown\n",
-			     report_count);
-	}
-	heaph_printf("HH: total allocation count - %llu\n",
-		     (long long)alloc_count_total);
+	if (report_count < count)
+		printf("HH: only first %d reports are shown\n", report_count);
+	printf("HH: total allocation count - %llu\n",
+	       (long long)alloc_count_total);
 }
 
 static void
@@ -478,19 +434,11 @@ heaph_init(void)
 	const char *hh_report = getenv("HHREPORT");
 	if (hh_report != NULL) {
 		if (strcmp(hh_report, "v") == 0)
-			report_mode = REPORT_MODE_VERBOSE;
+			report_mode = MODE_VERBOSE;
 		else if (strcmp(hh_report, "l") == 0)
-			report_mode = REPORT_MODE_LEAKS;
+			report_mode = MODE_LEAKS;
 		else if (strcmp(hh_report, "q") == 0)
-			report_mode = REPORT_MODE_QUIET;
-	}
-
-	const char *hh_content = getenv("HHCONTENT");
-	if (hh_content != NULL) {
-		if (strcmp(hh_content, "o") == 0)
-			content_mode = CONTENT_MODE_ORIGINAL;
-		else if (strcmp(hh_content, "t") == 0)
-			content_mode = CONTENT_MODE_TRASH;
+			report_mode = MODE_QUIET;
 	}
 	atexit(heaph_atexit);
 }
@@ -552,11 +500,8 @@ malloc(size_t size)
 	heaph_touch();
 	++depth;
 	void *res = default_malloc(size);
-	if (res != NULL) {
+	if (res != NULL)
 		alloc_trace_new(res, size);
-		if (content_mode == CONTENT_MODE_TRASH)
-			memset(res, '#', size);
-	}
 	--depth;
 	return res;
 }
@@ -582,9 +527,7 @@ realloc(void *ptr, size_t size)
 		ptr = NULL;
 	void *res = default_realloc(ptr, size);
 	if (ptr == NULL && res != NULL) {
-		if (content_mode == CONTENT_MODE_TRASH)
-			memset(res, '#', size);
-		alloc_trace_new(res, size);
+		alloc_trace_new(ptr, size);
 	} else if (ptr != NULL && res == NULL) {
 		alloc_free(ptr);
 	} else if (ptr != NULL && res != ptr) {
